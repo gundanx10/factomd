@@ -69,6 +69,15 @@ func (s *State) LogPrintf(logName string, format string, more ...interface{}) {
 }
 func (s *State) executeMsg(vm *VM, msg interfaces.IMsg) (ret bool) {
 
+  valid := -10
+	if a := s.Acks[msg.GetHash().Fixed()]; a != nil {
+    valid = msg.Validate(s)
+    if valid == 1 { 
+		  msg.FollowerExecute(s)
+    }
+		return true
+	}
+
 	preExecuteMsgTime := time.Now()
 	_, ok := s.Replay.Valid(constants.INTERNAL_REPLAY, msg.GetRepeatHash().Fixed(), msg.GetTimestamp(), s.GetTimestamp())
 	if !ok {
@@ -88,7 +97,9 @@ func (s *State) executeMsg(vm *VM, msg interfaces.IMsg) (ret bool) {
 		}
 	}
 
-	valid := msg.Validate(s)
+  if valid == -10 {
+	  valid = msg.Validate(s)
+  }
 	switch valid {
 	case 1:
 		// The highest block for which we have received a message.  Sometimes the same as
@@ -99,18 +110,10 @@ func (s *State) executeMsg(vm *VM, msg interfaces.IMsg) (ret bool) {
 		}
 
 		switch msg.Type() {
-		case constants.REVEAL_ENTRY_MSG:
+		case constants.REVEAL_ENTRY_MSG, constants.COMMIT_ENTRY_MSG, constants.COMMIT_CHAIN_MSG:
 			if !s.NoEntryYet(msg.GetHash(), nil) {
-				return true
-			}
-			s.Holding[msg.GetMsgHash().Fixed()] = msg
-		case constants.COMMIT_ENTRY_MSG:
-			if !s.NoEntryYet(msg.GetHash(), nil) {
-				return true
-			}
-			s.Holding[msg.GetMsgHash().Fixed()] = msg
-		case constants.COMMIT_CHAIN_MSG:
-			if !s.NoEntryYet(msg.GetHash(), nil) {
+				delete(s.Holding, msg.GetHash().Fixed())
+				s.Commits.Delete(msg.GetHash().Fixed())
 				return true
 			}
 			s.Holding[msg.GetMsgHash().Fixed()] = msg
@@ -384,18 +387,18 @@ func (s *State) ReviewHolding() {
 	highest := s.GetHighestKnownBlock()
 	saved := s.GetHighestSavedBlk()
 
+	for _, a := range s.Acks {
+		if s.Holding[a.GetHash().Fixed()] != nil {
+			a.FollowerExecute(s)
+		}
+	}
+
 	// Set this flag, so it acts as a constant.  We will set s.LeaderNewMin to false
 	// after processing the Holding Queue.  Ensures we only do this one per minute.
 	//	processMinute := s.LeaderNewMin // Have we processed this minute
 	s.LeaderNewMin++ // Either way, don't do it again until the ProcessEOM resets LeaderNewMin
 
 	for k, v := range s.Holding {
-		ack := s.Acks[k]
-		if ack != nil {
-			s.LogMessage("executeMsg", "Found Ack for this thing in Holding", v)
-			v.FollowerExecute(s)
-			continue
-		}
 
 		if v.Expire(s) {
 			s.LogMessage("executeMsg", "expire from holding", v)
@@ -606,15 +609,6 @@ func (s *State) FollowerExecuteEOM(m interfaces.IMsg) {
 		return // This is an internal EOM message.  We are not a leader so ignore.
 	}
 
-	eom, ok := m.(*messages.EOM)
-	if !ok {
-		return
-	}
-
-	if eom.DBHeight == s.ProcessLists.Lists[0].DBHeight && int(eom.Minute) < s.CurrentMinute {
-		return
-	}
-
 	FollowerEOMExecutions.Inc()
 	// add it to the holding queue in case AddToProcessList may remove it
 	TotalHoldingQueueInputs.Inc()
@@ -633,7 +627,8 @@ func (s *State) FollowerExecuteEOM(m interfaces.IMsg) {
 func (s *State) FollowerExecuteAck(msg interfaces.IMsg) {
 	ack := msg.(*messages.Ack)
 
-	if ack.DBHeight > s.HighestKnown {
+	// This is unsigned, so negative results are huge and out of range.  Don't want to claim we have too great a difference.
+	if ack.DBHeight-s.HighestKnown < 200 {
 		s.HighestKnown = ack.DBHeight
 	}
 
@@ -931,13 +926,12 @@ func (s *State) FollowerExecuteMMR(m interfaces.IMsg) {
 	if okm {
 		s.LogMessage("executeMsg", "FollowerExecute3", msg)
 		msg.FollowerExecute(s)
+
+		s.LogMessage("executeMsg", "FollowerExecute4", ack)
+		ack.FollowerExecute(s)
+
+		s.MissingResponseAppliedCnt++
 	}
-
-	s.LogMessage("executeMsg", "FollowerExecute4", ack)
-	ack.FollowerExecute(s)
-
-	s.MissingResponseAppliedCnt++
-
 }
 
 func (s *State) FollowerExecuteDataResponse(m interfaces.IMsg) {
@@ -1190,10 +1184,12 @@ func (s *State) LeaderExecuteEOM(m interfaces.IMsg) {
 	TotalAcksInputs.Inc()
 	s.Acks[eom.GetMsgHash().Fixed()] = ack
 	m.SetLocal(false)
+
+	ack.SendOut(s, ack)
+	m.SendOut(s, m)
+
 	s.FollowerExecuteEOM(m)
 	s.UpdateState()
-	delete(s.Acks, ack.GetHash().Fixed())
-	delete(s.Holding, m.GetMsgHash().Fixed())
 }
 
 func (s *State) LeaderExecuteDBSig(m interfaces.IMsg) {
@@ -1355,11 +1351,8 @@ func (s *State) ProcessCommitChain(dbheight uint32, commitChain interfaces.IMsg)
 		s.PutCommit(h, c)
 		entry := s.Holding[h.Fixed()]
 		if entry != nil {
-			entry.FollowerExecute(s)
+			s.executeMsg(pl.VMs[entry.GetVMIndex()], entry)
 			entry.SendOut(s, entry)
-			TotalXReviewQueueInputs.Inc()
-			s.XReview = append(s.XReview, entry)
-			TotalHoldingQueueOutputs.Inc()
 		}
 
 		return true
@@ -1379,13 +1372,11 @@ func (s *State) ProcessCommitEntry(dbheight uint32, commitEntry interfaces.IMsg)
 		h := c.GetHash()
 		s.PutCommit(h, c)
 		entry := s.Holding[h.Fixed()]
-		if entry != nil && entry.Validate(s) == 1 {
-			entry.FollowerExecute(s)
+		if entry != nil {
+			s.executeMsg(pl.VMs[entry.GetVMIndex()], entry)
 			entry.SendOut(s, entry)
-			TotalXReviewQueueInputs.Inc()
-			s.XReview = append(s.XReview, entry)
-			TotalHoldingQueueOutputs.Inc()
 		}
+
 		return true
 	}
 	//s.AddStatus("Cannot Process Commit Entry")

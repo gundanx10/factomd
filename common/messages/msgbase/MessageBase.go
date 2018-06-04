@@ -65,7 +65,7 @@ var places map[string]interfaces.IMsg = make(map[string]interfaces.IMsg)
 var sends, unique, duplicate int
 
 func (m *MessageBase) SendOut(s interfaces.IState, msg interfaces.IMsg) {
-if msg.GetNoResend() {
+	if msg.GetNoResend() {
 		return
 	}
 	// Are we ever modifying a message?
